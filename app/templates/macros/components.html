@@ -1,0 +1,57 @@
+{# Reusable UI component macros #}
+
+{% macro badge(text, variant='default') %}
+<span class="badge{% if variant != 'default' %} badge-{{ variant }}{% endif %}">{{ text }}</span>
+{% endmacro %}
+
+{% macro status_badge(status) %}
+{% if status == 'disabled' %}
+<span class="status status-disabled">Disabled</span>
+{% elif status == 'verified' %}
+<span class="status status-verified">Verified</span>
+{% elif status == 'pending' or status == 'unverified' %}
+<span class="status status-pending">{{ 'Pending' if status == 'pending' else 'Unverified' }}</span>
+{% elif status == 'active' %}
+<span class="status-active">Active</span>
+{% elif status == 'ended' %}
+<span class="status-ended">Ended</span>
+{% endif %}
+{% endmacro %}
+
+{% macro permission_badge(permission) %}
+<span class="permission-badge permission-{{ permission }}">
+    {%- if permission == 'owner' -%}Owner
+    {%- elif permission == 'edit' -%}Can edit
+    {%- else -%}View only
+    {%- endif -%}
+</span>
+{% endmacro %}
+
+{% macro role_badge(role) %}
+<span class="role-badge role-{{ role }}">
+    {%- if role == 'owner' -%}Owner
+    {%- elif role == 'admin' -%}Admin
+    {%- else -%}Member
+    {%- endif -%}
+</span>
+{% endmacro %}
+
+{% macro empty_state(message, action_url=None, action_text=None) %}
+<div class="empty-message">
+    <p>{{ message }}</p>
+    {% if action_url and action_text %}
+    <a href="{{ action_url }}" class="btn btn-primary mt-2">{{ action_text }}</a>
+    {% endif %}
+</div>
+{% endmacro %}
+
+{% macro page_header(title) %}
+<div class="page-header">
+    <h1>{{ title }}</h1>
+    {% if caller %}
+    <div class="actions">
+        {{ caller() }}
+    </div>
+    {% endif %}
+</div>
+{% endmacro %}

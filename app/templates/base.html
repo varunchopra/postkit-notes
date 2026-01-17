@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ app_name }}{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    {% if is_impersonating %}
+    <div class="impersonation-banner">
+        <span class="impersonation-indicator">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/></svg>
+        </span>
+        <span class="impersonation-text">
+            Viewing as <strong>{{ session.get('impersonated_email', 'user') }}</strong>
+            {% if impersonation_reason %}<span class="impersonation-reason">{{ impersonation_reason }}</span>{% endif %}
+        </span>
+        <form action="{{ url_for('views.orgs.end_impersonation_current') }}" method="post" class="impersonation-end">
+            <button type="submit" class="btn btn-sm">End Session</button>
+        </form>
+    </div>
+    {% endif %}
+    {% if user_id %}
+    <nav class="navbar">
+        <div class="nav-left">
+            <a href="{{ url_for('views.dashboard.index') }}" class="nav-brand">{{ app_name }}</a>
+            {% if current_org %}
+            <div class="org-selector">
+                <span class="org-name">{{ current_org.name }}</span>
+                {% if user_org_count > 1 %}
+                <a href="{{ url_for('views.orgs.select') }}" class="org-switch" title="Switch organization">Switch</a>
+                {% endif %}
+                <a href="{{ url_for('views.orgs.new') }}" class="org-new" title="Create new organization">+</a>
+            </div>
+            {% else %}
+            <a href="{{ url_for('views.orgs.new') }}" class="btn btn-sm btn-primary ml-2">Create Organization</a>
+            {% endif %}
+        </div>
+        <div class="nav-links">
+            {% if session.get('current_org_id') %}
+            <a href="{{ url_for('views.dashboard.index') }}">Dashboard</a>
+            <a href="{{ url_for('views.notes.index') }}">Notes</a>
+            <a href="{{ url_for('views.teams.index') }}">Teams</a>
+            <a href="{{ url_for('views.dashboard.sessions') }}">Sessions</a>
+            <a href="{{ url_for('views.dashboard.api_keys') }}">API Keys</a>
+            {% if is_admin %}
+            <a href="{{ url_for('views.orgs.settings', org_id=session.get('current_org_id')) }}">Org Settings</a>
+            {% endif %}
+            {% endif %}
+            <form action="{{ url_for('views.auth.logout') }}" method="post" class="d-inline">
+                <button type="submit" class="nav-logout-btn">Logout</button>
+            </form>
+        </div>
+    </nav>
+    {% endif %}
+
+    {% block body %}
+    <main class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+    {% endblock %}
+
+    <footer class="footer">
+        Powered by <a href="https://github.com/anthropics/postkit">Postkit</a>
+    </footer>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

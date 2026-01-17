@@ -1,0 +1,59 @@
+{% extends "orgs/settings_base.html" %}
+
+{% block settings_content %}
+<div class="audit-tabs">
+    <a href="{{ url_for('views.orgs.settings_audit', org_id=org.org_id) }}" class="audit-tab {% if audit_tab == 'permissions' %}active{% endif %}">Permissions</a>
+    <a href="{{ url_for('views.orgs.settings_audit_impersonations', org_id=org.org_id) }}" class="audit-tab {% if audit_tab == 'impersonations' %}active{% endif %}">Impersonations</a>
+</div>
+
+<div class="section">
+    <div class="section-header">
+        <h2>Impersonation Sessions ({{ impersonations|length }})</h2>
+    </div>
+
+    {% if impersonations %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th scope="col">Started</th>
+                <th scope="col">Admin</th>
+                <th scope="col">Viewed As</th>
+                <th scope="col">Reason</th>
+                <th scope="col">Duration</th>
+                <th scope="col">Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for imp in impersonations %}
+            <tr>
+                <td class="meta text-nowrap">{{ imp.started_at.strftime('%Y-%m-%d %H:%M') if imp.started_at else 'N/A' }}</td>
+                <td>
+                    <span title="{{ imp.actor_id }}">{{ imp.actor_email or imp.actor_id[:8] ~ '...' }}</span>
+                </td>
+                <td>
+                    <span title="{{ imp.target_user_id }}">{{ imp.target_email or imp.target_user_id[:8] ~ '...' }}</span>
+                </td>
+                <td class="reason-cell">{{ imp.reason }}</td>
+                <td class="meta">
+                    {% if imp.ended_at %}
+                        {{ ((imp.ended_at - imp.started_at).total_seconds() / 60) | int }} min
+                    {% elif imp.started_at %}
+                        <span class="status-active">Active</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if imp.ended_at %}
+                    <span class="status-ended">Ended</span>
+                    {% else %}
+                    <span class="status-active">Active</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-message">No impersonation sessions found</div>
+    {% endif %}
+</div>
+{% endblock %}

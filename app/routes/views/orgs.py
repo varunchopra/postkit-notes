@@ -1,0 +1,1003 @@
+"""Organization management views."""
+
+import logging
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from flask import (
+    Blueprint,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from psycopg.rows import dict_row
+
+from ...auth import (
+    get_org,
+    get_org_by_slug,
+    get_session_user,
+    get_user_orgs,
+)
+from ...db import (
+    get_authn,
+    get_authz,
+    get_db,
+    get_meter,
+    get_org_config,
+    get_system_config,
+)
+from ...constants import (
+    METER_RESOURCE_SEATS,
+    METER_RESOURCE_STORAGE,
+    METER_UNIT_CHARACTERS,
+    METER_UNIT_MEMBERS,
+    ORG_POOL_USER,
+)
+from ...security import (
+    OrgContext,
+    UserContext,
+    authenticated,
+    create_token,
+    is_org_member,
+)
+
+bp = Blueprint("orgs", __name__, url_prefix="/orgs")
+log = logging.getLogger(__name__)
+
+
+def slugify(name: str) -> str:
+    """Convert org name to URL-friendly slug."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug)
+    return slug[:50].strip("-")
+
+
+def create_org_membership(org_id: str, user_id: str, role: str = "member") -> None:
+    """Create org membership record."""
+    with get_db().cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO org_memberships (org_id, user_id, role)
+            VALUES (%s, %s, %s)
+            """,
+            (org_id, user_id, role),
+        )
+
+
+def create_org_with_owner(org_id: str, name: str, slug: str, owner_id: str) -> None:
+    """Create organization with owner membership and authz grants.
+
+    Combines org record creation, owner membership, and authz initialization
+    into a single function since these always happen together.
+    """
+    # Create org record
+    with get_db().cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO orgs (org_id, name, slug, owner_id)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (org_id, name, slug, owner_id),
+        )
+
+    # Create membership as owner
+    create_org_membership(org_id, owner_id, role="owner")
+
+    # Initialize authz namespace
+    authz = get_authz(org_id)
+    authz.grant("owner", resource=("org", org_id), subject=("user", owner_id))
+
+
+def get_org_members(org_id: str) -> list[dict]:
+    """Get all members of an organization."""
+    with get_db().cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT m.user_id, m.role, m.created_at,
+                   u.email
+            FROM org_memberships m
+            LEFT JOIN authn.users u ON m.user_id = u.id::text
+            WHERE m.org_id = %s
+            ORDER BY m.role, m.created_at
+            """,
+            (org_id,),
+        )
+        return cur.fetchall()
+
+
+def get_org_invites(org_id: str) -> list[dict]:
+    with get_db().cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT * FROM org_invites
+            WHERE org_id = %s
+            AND used_at IS NULL
+            AND expires_at > now()
+            ORDER BY created_at DESC
+            """,
+            (org_id,),
+        )
+        return cur.fetchall()
+
+
+@bp.get("/select")
+@authenticated
+def select(ctx: UserContext):
+    """Org selection page - shown when user has multiple orgs or none."""
+    user_id = ctx.user_id
+    orgs = get_user_orgs(user_id)
+
+    if not orgs:
+        # No orgs - redirect to create first org
+        return redirect(url_for(".new"))
+
+    if len(orgs) == 1:
+        # Single org - auto-select and redirect
+        session["current_org_id"] = orgs[0]["org_id"]
+        return redirect(url_for("views.dashboard.index"))
+
+    return render_template("orgs/select.html", orgs=orgs)
+
+
+@bp.get("/new")
+@authenticated
+def new(ctx: UserContext):
+    """Show create organization form."""
+    return render_template("orgs/new.html")
+
+
+@bp.post("")
+@authenticated
+def create(ctx: UserContext):
+    """Create a new organization."""
+    user_id = ctx.user_id
+    name = request.form.get("name", "").strip()
+
+    if not name:
+        flash("Organization name is required", "error")
+        return redirect(url_for(".new"))
+
+    if len(name) < 2:
+        flash("Organization name must be at least 2 characters", "error")
+        return redirect(url_for(".new"))
+
+    slug = slugify(name)
+
+    # Check if slug is unique
+    if get_org_by_slug(slug):
+        flash("An organization with a similar name already exists", "error")
+        return redirect(url_for(".new"))
+
+    # Generate org_id
+    import uuid
+
+    org_id = str(uuid.uuid4())
+
+    # Create org with owner
+    create_org_with_owner(org_id, name, slug, user_id)
+
+    # Initialize org config with plan and default settings
+    org_config = get_org_config(org_id)
+    org_config.set("plan", "free")
+    org_config.set(
+        "settings",
+        {"allow_public_notes": False, "default_share_permission": "view"},
+    )
+
+    # Get seat allocation from plan definition
+    system_config = get_system_config()
+    plan = system_config.get_value("plans/free", default={"seats": 3})
+    seat_allocation = plan.get("seats", 3)
+
+    # Allocate seats and consume 1 for owner (org-level pool)
+    meter = get_meter(org_id)
+    if seat_allocation > 0:  # -1 means unlimited
+        meter.allocate(
+            ORG_POOL_USER, METER_RESOURCE_SEATS, seat_allocation, METER_UNIT_MEMBERS
+        )
+        meter.consume(ORG_POOL_USER, METER_RESOURCE_SEATS, 1, METER_UNIT_MEMBERS)
+
+    # Set as current org
+    session["current_org_id"] = org_id
+
+    log.info(f"Organization created: org_id={org_id[:8]}... name={name}")
+    flash(f"Organization '{name}' created!", "success")
+    return redirect(url_for("views.dashboard.index"))
+
+
+@bp.post("/<org_id>/switch")
+@authenticated
+def switch(ctx: UserContext, org_id: str):
+    """Switch to a different organization."""
+    user_id = ctx.user_id
+
+    if not is_org_member(user_id, org_id):
+        flash("You don't have access to that organization", "error")
+        return redirect(url_for(".select"))
+
+    org = get_org(org_id)
+    if not org:
+        flash("Organization not found", "error")
+        return redirect(url_for(".select"))
+
+    session["current_org_id"] = org_id
+    flash(f"Switched to {org['name']}", "success")
+    return redirect(url_for("views.dashboard.index"))
+
+
+def _verify_settings_access(org_id: str):
+    """Common verification for settings pages."""
+    if session.get("current_org_id") != org_id:
+        flash("Please switch to the organization first", "error")
+        return None, redirect(url_for(".select"))
+
+    org = get_org(org_id)
+    if not org:
+        flash("Organization not found", "error")
+        return None, redirect(url_for(".select"))
+
+    return org, None
+
+
+@bp.get("/<org_id>/settings")
+@authenticated(org=True, admin=True)
+def settings(ctx: OrgContext, org_id: str):
+    """Organization settings - General tab."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    return render_template(
+        "orgs/settings/general.html",
+        org=org,
+        is_owner=ctx.user_id == org["owner_id"],
+        active_tab="general",
+    )
+
+
+@bp.get("/<org_id>/settings/members")
+@authenticated(org=True, admin=True)
+def settings_members(ctx: OrgContext, org_id: str):
+    """Organization settings - Members tab (consolidated)."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    authz = get_authz(org_id)
+
+    # Get all members with full user details
+    with get_db().cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT u.id::text as user_id, u.email, u.created_at,
+                   u.email_verified_at, u.disabled_at, m.role as org_role
+            FROM authn.users u
+            JOIN org_memberships m ON u.id::text = m.user_id
+            WHERE m.org_id = %s
+            ORDER BY
+                CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                u.created_at DESC
+            """,
+            (org_id,),
+        )
+        members = cur.fetchall()
+
+    # Check admin status and count stats
+    admin_count = 0
+    disabled_count = 0
+    for member in members:
+        member["is_admin"] = authz.check(
+            ("user", member["user_id"]), "admin", ("org", org_id)
+        )
+        if member["is_admin"] or member["user_id"] == org["owner_id"]:
+            admin_count += 1
+        if member["disabled_at"]:
+            disabled_count += 1
+
+    invites = get_org_invites(org_id)
+
+    return render_template(
+        "orgs/settings/members.html",
+        org=org,
+        members=members,
+        invites=invites,
+        admin_count=admin_count,
+        disabled_count=disabled_count,
+        current_user_id=ctx.user_id,
+        is_owner=ctx.user_id == org["owner_id"],
+        active_tab="members",
+    )
+
+
+@bp.get("/<org_id>/settings/audit")
+@authenticated(org=True, admin=True)
+def settings_audit(ctx: OrgContext, org_id: str):
+    """Organization settings - Audit tab (Permissions)."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    authz = get_authz(org_id)
+
+    # Get filter parameters
+    event_type = request.args.get("event_type")
+    actor_id = request.args.get("actor_id")
+
+    # Fetch audit events from authz (org-scoped)
+    events = authz.get_audit_events(
+        event_type=event_type if event_type else None,
+        actor_id=actor_id if actor_id else None,
+        limit=100,
+    )
+
+    return render_template(
+        "orgs/settings/audit.html",
+        org=org,
+        events=events,
+        filter_event_type=event_type,
+        filter_actor_id=actor_id,
+        active_tab="audit",
+        audit_tab="permissions",
+    )
+
+
+@bp.get("/<org_id>/settings/audit/impersonations")
+@authenticated(org=True, admin=True)
+def settings_audit_impersonations(ctx: OrgContext, org_id: str):
+    """Organization settings - Audit tab (Impersonations)."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    authn = get_authn()
+
+    # Fetch impersonation history
+    impersonations = authn.list_impersonation_history(limit=100)
+
+    return render_template(
+        "orgs/settings/audit_impersonations.html",
+        org=org,
+        impersonations=impersonations,
+        active_tab="audit",
+        audit_tab="impersonations",
+    )
+
+
+@bp.post("/<org_id>/invite")
+@authenticated(org=True, admin=True)
+def create_invite(ctx: OrgContext, org_id: str):
+    """Create an invite link for the organization."""
+    if session.get("current_org_id") != org_id:
+        flash("Please switch to the organization first", "error")
+        return redirect(url_for(".select"))
+
+    email = request.form.get("email", "").strip().lower() or None
+    role = request.form.get("role", "member")
+    try:
+        expires_days = int(request.form.get("expires_days", 7))
+    except ValueError:
+        expires_days = 7
+
+    if role not in ("admin", "member"):
+        role = "member"
+
+    code = secrets.token_urlsafe(16)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+
+    with get_db().cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO org_invites (org_id, code, email, role, created_by, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (org_id, code, email, role, ctx.user_id, expires_at),
+        )
+
+    invite_url = url_for("views.orgs.view_invite", code=code, _external=True)
+    log.info(f"Invite created: org_id={org_id[:8]}... code={code[:8]}...")
+
+    flash(f"Invite created! Share this link: {invite_url}", "success")
+    return redirect(url_for(".settings", org_id=org_id))
+
+
+@bp.get("/invite/<code>")
+def view_invite(code: str):
+    """View invite details (before accepting)."""
+    with get_db().cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT i.*, o.name as org_name
+            FROM org_invites i
+            JOIN orgs o ON i.org_id = o.org_id
+            WHERE i.code = %s
+            AND i.used_at IS NULL
+            AND i.expires_at > now()
+            """,
+            (code,),
+        )
+        invite = cur.fetchone()
+
+    if not invite:
+        flash("Invalid or expired invite link", "error")
+        return redirect(url_for("views.auth.login"))
+
+    # Check if user is logged in
+    user_id = get_session_user()
+
+    if user_id:
+        # Check if already a member
+        if is_org_member(user_id, invite["org_id"]):
+            session["current_org_id"] = invite["org_id"]
+            flash(f"You're already a member of {invite['org_name']}", "info")
+            return redirect(url_for("views.dashboard.index"))
+
+    return render_template(
+        "orgs/invite.html",
+        invite=invite,
+        is_logged_in=user_id is not None,
+    )
+
+
+@bp.post("/invite/<code>/accept")
+@authenticated
+def accept_invite(ctx: UserContext, code: str):
+    """Accept an invitation to join an organization."""
+    user_id = ctx.user_id
+    authn = get_authn()
+
+    # Wrap all operations in a transaction with FOR UPDATE to prevent race conditions
+    try:
+        with get_db().transaction():
+            # Lock the invite row to prevent concurrent acceptance
+            with get_db().cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM org_invites
+                    WHERE code = %s
+                    AND used_at IS NULL
+                    AND expires_at > now()
+                    FOR UPDATE
+                    """,
+                    (code,),
+                )
+                invite = cur.fetchone()
+
+            if not invite:
+                flash("Invalid or expired invite link", "error")
+                return redirect(url_for(".select"))
+
+            # Check if invite is for specific email
+            if invite["email"]:
+                user = authn.get_user(user_id)
+                if user and user["email"].lower() != invite["email"]:
+                    flash("This invite is for a different email address", "error")
+                    return redirect(url_for(".select"))
+
+            # Check if already a member
+            if is_org_member(user_id, invite["org_id"]):
+                session["current_org_id"] = invite["org_id"]
+                flash("You're already a member of this organization", "info")
+                return redirect(url_for("views.dashboard.index"))
+
+            # Create membership FIRST
+            create_org_membership(invite["org_id"], user_id, role=invite["role"])
+
+            # Grant org permission in authz
+            authz = get_authz(invite["org_id"])
+            authz.grant(
+                invite["role"],
+                resource=("org", invite["org_id"]),
+                subject=("user", user_id),
+            )
+
+            # THEN consume seat (if limited plan)
+            meter = get_meter(invite["org_id"])
+            balance = meter.get_balance(
+                ORG_POOL_USER, METER_RESOURCE_SEATS, METER_UNIT_MEMBERS
+            )
+
+            if (
+                balance
+                and balance.get("balance") is not None
+                and balance.get("balance", 0) >= 0
+            ):
+                result = meter.consume(
+                    ORG_POOL_USER,
+                    METER_RESOURCE_SEATS,
+                    1,
+                    METER_UNIT_MEMBERS,
+                    check_balance=True,
+                )
+                if not result.get("success", False):
+                    raise ValueError("No seats available")
+
+            # Mark invite as used
+            with get_db().cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE org_invites
+                    SET used_at = now(), used_by = %s
+                    WHERE invite_id = %s
+                    """,
+                    (user_id, invite["invite_id"]),
+                )
+    except ValueError:
+        flash(
+            "Organization has no available seats. Contact admin to upgrade.",
+            "error",
+        )
+        return redirect(url_for(".select"))
+
+    # Set as current org
+    session["current_org_id"] = invite["org_id"]
+
+    org = get_org(invite["org_id"])
+    log.info(
+        f"User joined org via invite: user_id={user_id[:8]}... org_id={invite['org_id'][:8]}..."
+    )
+    flash(f"Welcome to {org['name']}!", "success")
+    return redirect(url_for("views.dashboard.index"))
+
+
+@bp.post("/<org_id>/members/<member_id>/remove")
+@authenticated(org=True, admin=True)
+def remove_member(ctx: OrgContext, org_id: str, member_id: str):
+    """Remove a member from the organization."""
+    if session.get("current_org_id") != org_id:
+        flash("Please switch to the organization first", "error")
+        return redirect(url_for(".select"))
+
+    org = get_org(org_id)
+    if not org:
+        flash("Organization not found", "error")
+        return redirect(url_for(".select"))
+
+    # Can't remove the owner
+    if member_id == org["owner_id"]:
+        flash("Cannot remove the organization owner", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    # Can't remove yourself
+    if member_id == ctx.user_id:
+        flash("Cannot remove yourself. Use 'Leave Organization' instead.", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    authz = get_authz(org_id)
+    authn = get_authn()
+
+    # Revoke org role permissions
+    for role in ("owner", "admin", "member"):
+        authz.revoke(role, resource=("org", org_id), subject=("user", member_id))
+
+    # Revoke all grants this user has to resources in this org
+    user_grants = authz.list_grants(("user", member_id))
+    for grant in user_grants:
+        authz.revoke(
+            grant["relation"],
+            resource=(grant["resource_type"], grant["resource_id"]),
+            subject=("user", member_id),
+        )
+
+    # Revoke all API key grants for this user's keys in this org
+    for key in authn.list_api_keys(member_id):
+        key_grants = authz.list_grants(("api_key", key["key_id"]))
+        for grant in key_grants:
+            authz.revoke(
+                grant["relation"],
+                resource=(grant["resource_type"], grant["resource_id"]),
+                subject=("api_key", key["key_id"]),
+            )
+
+    # Remove membership
+    with get_db().cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM org_memberships
+            WHERE org_id = %s AND user_id = %s
+            """,
+            (org_id, member_id),
+        )
+
+    # Credit back the seat to org pool
+    meter = get_meter(org_id)
+    meter.adjust(ORG_POOL_USER, METER_RESOURCE_SEATS, 1, METER_UNIT_MEMBERS)
+
+    log.info(f"Member removed: user_id={member_id[:8]}... org_id={org_id[:8]}...")
+    flash("Member removed", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.post("/<org_id>/leave")
+@authenticated
+def leave(ctx: UserContext, org_id: str):
+    """Leave an organization."""
+    user_id = ctx.user_id
+
+    org = get_org(org_id)
+    if not org:
+        flash("Organization not found", "error")
+        return redirect(url_for(".select"))
+
+    # Can't leave if you're the owner
+    if user_id == org["owner_id"]:
+        flash("Owners cannot leave. Transfer ownership first.", "error")
+        return redirect(url_for(".settings", org_id=org_id))
+
+    if not is_org_member(user_id, org_id):
+        flash("You're not a member of this organization", "error")
+        return redirect(url_for(".select"))
+
+    authz = get_authz(org_id)
+    authn = get_authn()
+
+    # Revoke org role permissions
+    for role in ("owner", "admin", "member"):
+        authz.revoke(role, resource=("org", org_id), subject=("user", user_id))
+
+    # Revoke all grants this user has to resources in this org
+    user_grants = authz.list_grants(("user", user_id))
+    for grant in user_grants:
+        authz.revoke(
+            grant["relation"],
+            resource=(grant["resource_type"], grant["resource_id"]),
+            subject=("user", user_id),
+        )
+
+    # Revoke all API key grants for this user's keys in this org
+    for key in authn.list_api_keys(user_id):
+        key_grants = authz.list_grants(("api_key", key["key_id"]))
+        for grant in key_grants:
+            authz.revoke(
+                grant["relation"],
+                resource=(grant["resource_type"], grant["resource_id"]),
+                subject=("api_key", key["key_id"]),
+            )
+
+    # Remove membership
+    with get_db().cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM org_memberships
+            WHERE org_id = %s AND user_id = %s
+            """,
+            (org_id, user_id),
+        )
+
+    # Credit back the seat to org pool
+    meter = get_meter(org_id)
+    meter.adjust(ORG_POOL_USER, METER_RESOURCE_SEATS, 1, METER_UNIT_MEMBERS)
+
+    # Clear current org if it was this one
+    if session.get("current_org_id") == org_id:
+        session.pop("current_org_id", None)
+
+    log.info(f"User left org: user_id={user_id[:8]}... org_id={org_id[:8]}...")
+    flash(f"You have left {org['name']}", "success")
+    return redirect(url_for(".select"))
+
+
+@bp.post("/<org_id>/users/<user_id>/disable")
+@authenticated(org=True, admin=True)
+def disable_user(ctx: OrgContext, org_id: str, user_id: str):
+    """Disable a user account."""
+    if user_id == ctx.user_id:
+        flash("You cannot disable your own account", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    authn = get_authn()
+    authn.disable_user(user_id)
+
+    log.info(f"User disabled by admin: user_id={user_id[:8]}...")
+    flash("User disabled", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.post("/<org_id>/users/<user_id>/enable")
+@authenticated(org=True, admin=True)
+def enable_user(ctx: OrgContext, org_id: str, user_id: str):
+    """Enable a disabled user account."""
+    authn = get_authn()
+    authn.enable_user(user_id)
+
+    log.info(f"User enabled by admin: user_id={user_id[:8]}...")
+    flash("User enabled", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.post("/<org_id>/users/<user_id>/grant-admin")
+@authenticated(org=True, admin=True)
+def grant_admin(ctx: OrgContext, org_id: str, user_id: str):
+    """Grant org admin permission to a user."""
+    authz = get_authz(org_id)
+    authz.grant("admin", resource=("org", org_id), subject=("user", user_id))
+
+    log.info(f"Org admin granted: org_id={org_id[:8]}... user_id={user_id[:8]}...")
+    flash("Admin permission granted", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.post("/<org_id>/users/<user_id>/revoke-admin")
+@authenticated(org=True, admin=True)
+def revoke_admin(ctx: OrgContext, org_id: str, user_id: str):
+    """Revoke org admin permission from a user."""
+    if user_id == ctx.user_id:
+        flash("You cannot revoke your own admin permission", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    authz = get_authz(org_id)
+    authz.revoke("admin", resource=("org", org_id), subject=("user", user_id))
+
+    log.info(f"Org admin revoked: org_id={org_id[:8]}... user_id={user_id[:8]}...")
+    flash("Admin permission revoked", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.post("/<org_id>/users/<user_id>/transfer-ownership")
+@authenticated(org=True, admin=True)
+def transfer_ownership(ctx: OrgContext, org_id: str, user_id: str):
+    """Transfer organization ownership to another member."""
+    org = get_org(org_id)
+    if not org:
+        flash("Organization not found", "error")
+        return redirect(url_for(".select"))
+
+    # Only the current owner can transfer ownership
+    if ctx.user_id != org["owner_id"]:
+        flash("Only the owner can transfer ownership", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    # Can't transfer to yourself
+    if user_id == ctx.user_id:
+        flash("You are already the owner", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    authz = get_authz(org_id)
+
+    with get_db().transaction():
+        # Update org owner_id in database
+        with get_db().cursor() as cur:
+            cur.execute(
+                """
+                UPDATE orgs SET owner_id = %s, updated_at = now()
+                WHERE org_id = %s
+                """,
+                (user_id, org_id),
+            )
+
+            # Update org_memberships roles
+            cur.execute(
+                """
+                UPDATE org_memberships SET role = 'admin'
+                WHERE org_id = %s AND user_id = %s
+                """,
+                (org_id, ctx.user_id),
+            )
+            cur.execute(
+                """
+                UPDATE org_memberships SET role = 'owner'
+                WHERE org_id = %s AND user_id = %s
+                """,
+                (org_id, user_id),
+            )
+
+        # Update authz permissions - transfer_grant is atomic (grant before revoke)
+        authz.revoke("admin", resource=("org", org_id), subject=("user", user_id))
+        authz.revoke("member", resource=("org", org_id), subject=("user", user_id))
+        authz.transfer_grant(
+            "owner",
+            resource=("org", org_id),
+            from_subject=("user", ctx.user_id),
+            to_subject=("user", user_id),
+        )
+        authz.grant("admin", resource=("org", org_id), subject=("user", ctx.user_id))
+
+    log.info(
+        f"Ownership transferred: org_id={org_id[:8]}... from={ctx.user_id[:8]}... to={user_id[:8]}..."
+    )
+    flash("Ownership transferred successfully. You are now an admin.", "success")
+    return redirect(url_for(".settings_members", org_id=org_id))
+
+
+@bp.get("/<org_id>/users/<user_id>/sessions")
+@authenticated(org=True, admin=True)
+def user_sessions(ctx: OrgContext, org_id: str, user_id: str):
+    """View sessions for a specific user."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    authn = get_authn()
+
+    user = authn.get_user(user_id)
+    if not user:
+        flash("User not found", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    sessions = authn.list_sessions(user_id)
+
+    return render_template(
+        "orgs/settings/user_sessions.html",
+        org=org,
+        target_user={"user_id": user_id, "email": user["email"]},
+        sessions=sessions,
+        active_tab="members",
+    )
+
+
+@bp.post("/<org_id>/users/<user_id>/sessions/<session_id>/revoke")
+@authenticated(org=True, admin=True)
+def revoke_user_session(ctx: OrgContext, org_id: str, user_id: str, session_id: str):
+    """Revoke a specific session for a user."""
+    authn = get_authn()
+    revoked = authn.revoke_session_by_id(session_id, user_id)
+
+    if revoked:
+        log.info(f"Session revoked by admin: session_id={session_id[:8]}...")
+        flash("Session revoked", "success")
+    else:
+        flash("Session not found", "error")
+
+    return redirect(url_for(".user_sessions", org_id=org_id, user_id=user_id))
+
+
+@bp.get("/<org_id>/settings/usage")
+@authenticated(org=True, admin=True)
+def settings_usage(ctx: OrgContext, org_id: str):
+    """Organization settings - Usage tab with per-user breakdown."""
+    org, error = _verify_settings_access(org_id)
+    if error:
+        return error
+
+    meter = get_meter(org_id)
+    org_config = get_org_config(org_id)
+    system_config = get_system_config()
+
+    # Get org's plan
+    plan_key = org_config.get_value("plan", default="free")
+    plan = system_config.get_value(
+        f"plans/{plan_key}", default={"seats": 3, "name": "Free"}
+    )
+
+    # Get pricing (org override for enterprise, else plan defaults)
+    org_pricing = org_config.get_value("pricing", default={})
+    seat_price = (
+        org_pricing.get("seat_price")
+        if org_pricing.get("seat_price") is not None
+        else plan.get("seat_price", 0)
+    )
+    storage_rate = (
+        org_pricing.get("storage_rate")
+        if org_pricing.get("storage_rate") is not None
+        else plan.get("storage_rate", 0)
+    )
+
+    # Seat info from org pool
+    members = get_org_members(org_id)
+    is_unlimited = plan.get("seats", 0) < 0
+
+    # Per-user storage breakdown
+    user_storage = {}
+    for member in members:
+        user_balance = meter.get_balance(
+            member["user_id"], METER_RESOURCE_STORAGE, METER_UNIT_CHARACTERS
+        )
+        user_storage[member["user_id"]] = abs(user_balance.get("balance", 0) or 0)
+
+    total_storage = sum(user_storage.values())
+
+    return render_template(
+        "orgs/settings/usage.html",
+        org=org,
+        plan=plan,
+        plan_key=plan_key,
+        seats_allocated=plan.get("seats") if not is_unlimited else None,
+        seats_used=len(members),
+        is_unlimited=is_unlimited,
+        storage_used=total_storage,
+        user_storage=user_storage,
+        members=members,
+        seat_price=seat_price or 0,
+        storage_rate=storage_rate or 0,
+        storage_cost=total_storage * (storage_rate or 0),
+        active_tab="usage",
+    )
+
+
+@bp.post("/<org_id>/users/<user_id>/impersonate")
+@authenticated(org=True, admin=True)
+def start_impersonation(ctx: OrgContext, org_id: str, user_id: str):
+    """Start impersonating a user (admin only)."""
+
+    if user_id == ctx.user_id:
+        flash("Cannot impersonate yourself", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    # Get reason from form
+    reason = request.form.get("reason", "").strip()
+    if not reason:
+        flash("Impersonation reason is required", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    authn = get_authn()
+
+    # Get current session ID (the admin's session)
+    token_hash = session.get("token_hash")
+    if not token_hash:
+        flash("Session not found", "error")
+        return redirect(url_for(".settings_members", org_id=org_id))
+
+    db_session = authn.validate_session(token_hash)
+    if not db_session:
+        flash("Invalid session", "error")
+        return redirect(url_for("views.auth.login"))
+
+    admin_session_id = db_session["session_id"]
+
+    try:
+        # Generate token hash for impersonation session
+        _, imp_token_hash = create_token()
+
+        # Create impersonation session
+        result = authn.start_impersonation(
+            actor_session_id=admin_session_id,
+            target_user_id=user_id,
+            reason=reason,
+            token_hash=imp_token_hash,
+        )
+
+        # Store original session so we can restore it
+        session["original_token_hash"] = session.get("token_hash")
+        session["impersonation_id"] = str(result["impersonation_id"])
+        # Switch to impersonation session
+        session["token_hash"] = imp_token_hash
+
+        user = authn.get_user(user_id)
+        session["impersonated_email"] = user["email"]
+        log.info(
+            f"Impersonation started: admin={ctx.user_id[:8]}... target={user_id[:8]}... reason={reason}"
+        )
+        flash(f"Now viewing as {user['email']}", "success")
+
+    except Exception as e:
+        log.exception("Failed to start impersonation")
+        flash(f"Failed to start impersonation: {e}", "error")
+
+    return redirect(url_for("views.dashboard.index"))
+
+
+@bp.post("/impersonation/end")
+@authenticated
+def end_impersonation_current(ctx: UserContext):
+    """End the current impersonation session (called from banner)."""
+    impersonation_id = session.get("impersonation_id")
+    original_token_hash = session.get("original_token_hash")
+
+    if not impersonation_id or not original_token_hash:
+        flash("No active impersonation", "error")
+        return redirect(url_for("views.dashboard.index"))
+
+    authn = get_authn()
+
+    try:
+        authn.end_impersonation(impersonation_id)
+
+        # Restore original session
+        session["token_hash"] = original_token_hash
+        session.pop("original_token_hash", None)
+        session.pop("impersonation_id", None)
+        session.pop("impersonated_email", None)
+
+        log.info(f"Impersonation ended: impersonation_id={impersonation_id[:8]}...")
+        flash("Impersonation ended", "success")
+
+    except Exception as e:
+        log.exception("Failed to end impersonation")
+        flash(f"Failed to end impersonation: {e}", "error")
+
+    return redirect(url_for("views.dashboard.index"))
